@@ -75,6 +75,32 @@
         </div>
       </div>
 
+      <!-- 存储配额 -->
+      <div class="card">
+        <div class="card-title">存储配额 <span class="hint">已用 = 活动文件 + 回收站 + 历史版本 + 进行中上传预占</span>
+          <span class="spacer"></span>
+          <button class="btn xs primary" id="btn-quota-user">设置用户配额</button>
+          <button class="btn xs primary" id="btn-quota-dir">设置目录配额</button>
+          <button class="btn xs ghost" id="btn-quota-refresh">⟳ 刷新</button>
+        </div>
+        <div class="grid cols-2" style="gap:14px;margin-top:12px">
+          <div>
+            <div class="small muted" style="margin-bottom:6px">用户配额</div>
+            <div class="table-wrap scroll-y" style="max-height:360px"><table class="tbl">
+              <thead><tr><th>用户</th><th>用量水位</th><th class="right">已用</th><th class="right">上限</th><th class="right">剩余</th><th>操作</th></tr></thead>
+              <tbody id="quota-user-body"></tbody>
+            </table></div>
+          </div>
+          <div>
+            <div class="small muted" style="margin-bottom:6px">目录配额（含全部子目录）</div>
+            <div class="table-wrap scroll-y" style="max-height:360px"><table class="tbl">
+              <thead><tr><th>目录</th><th>用量水位</th><th class="right">已用</th><th class="right">上限</th><th class="right">剩余</th><th>操作</th></tr></thead>
+              <tbody id="quota-dir-body"></tbody>
+            </table></div>
+          </div>
+        </div>
+      </div>
+
       <!-- 元数据文档 -->
       <div class="card">
         <div class="card-title">集中元数据（JSON 文档）<span class="hint">原子写 · 版本向量 · NameNode 单点权威，cluster 文档向 DataNode 同步</span></div>
@@ -92,13 +118,14 @@
 <script>
 "use strict";
 const { api, esc, fmtBytes, fmtTs, fmtAgo, toast, svgDonut, svgBars, svgLine,
-        sparkline, legend, PALETTE } = DFSVS;
+        sparkline, legend, PALETTE, promptDlg } = DFSVS;
 
 async function loadAll() {
-  const [ov, tl, hot] = await Promise.all([
+  const [ov, tl, hot, quotas] = await Promise.all([
     api("GET", "/api/stats/overview"),
     api("GET", "/api/stats/timeline?hours=24"),
     api("GET", "/api/stats/hotness?limit=10"),
+    api("GET", "/api/quotas").catch(e => e.status === 403 ? null : Promise.reject(e)),
   ]);
   renderKpis(ov);
   renderCapacity(ov);
@@ -108,6 +135,7 @@ async function loadAll() {
   renderExt(ov);
   renderHot(hot);
   renderMeta(ov);
+  renderQuotas(quotas);
 }
 
 function renderKpis(ov) {
@@ -250,6 +278,89 @@ function renderMeta(ov) {
     `累计原子写 ${ms.atomic_writes || 0} 次 · 文档同步应用 ${ms.syncs_applied || 0} / 跳过 ${ms.syncs_skipped || 0} · 版本向量冲突 ${ms.conflicts || 0} 次（冲突按权威节点策略解决并留痕）`;
   // 补充每文档写次数（overview.meta 未含 writes，这里用 summary 展示总量）
 }
+
+function quotaBar(row) {
+  const ratio = row.limit ? Math.min(row.usage_ratio || 0, 1) : 0;
+  const cls = row.over_limit ? "bad" : ratio > 0.85 ? "warn" : "ok";
+  return `<div class="pbar thin" title="活动 ${fmtBytes(row.components.active)} / 回收站 ${fmtBytes(row.components.trash)} / 历史 ${fmtBytes(row.components.history)} / 预占 ${fmtBytes(row.components.reserved)}">
+    <i class="${cls}" style="width:${(ratio * 100).toFixed(1)}%"></i>
+  </div>`;
+}
+
+function quotaAction(row, type) {
+  const label = row.limit == null ? "设置" : "调整";
+  return `<button class="btn xs q-edit" data-type="${type}" data-id="${esc(type === "user" ? row.username : row.path)}">✎ ${label}</button>
+          ${row.limit != null ? `<button class="btn xs ghost q-clear" data-type="${type}" data-id="${esc(type === "user" ? row.username : row.path)}">取消</button>` : ""}`;
+}
+
+function renderQuotaRows(rows, bodyId, type) {
+  const body = document.getElementById(bodyId);
+  body.innerHTML = rows.length ? rows.map(r => `
+    <tr class="${r.over_limit ? "row-danger" : ""}">
+      <td class="mono small"><b>${esc(type === "user" ? r.username : r.path)}</b>${r.over_limit ? ' <span class="badge bad plain">超限</span>' : ""}
+        <div class="small muted">活动 ${fmtBytes(r.components.active)} · 回收站 ${fmtBytes(r.components.trash)} · 历史 ${fmtBytes(r.components.history)} · 预占 ${fmtBytes(r.components.reserved)}</div>
+      </td>
+      <td style="min-width:140px">${quotaBar(r)}</td>
+      <td class="num right">${fmtBytes(r.used)}</td>
+      <td class="num right">${r.limit == null ? "不限" : fmtBytes(r.limit)}</td>
+      <td class="num right ${r.over_limit ? "bad" : ""}">${r.limit == null ? "—" : fmtBytes(r.remaining)}</td>
+      <td class="nowrap">${quotaAction(r, type)}</td>
+    </tr>`).join("") : `<tr><td colspan="6" class="empty small">暂无数据</td></tr>`;
+  body.querySelectorAll(".q-edit").forEach(btn => btn.onclick = () => editQuota(btn.dataset.type, btn.dataset.id));
+  body.querySelectorAll(".q-clear").forEach(btn => btn.onclick = () => clearQuota(btn.dataset.type, btn.dataset.id));
+}
+
+function renderQuotas(data) {
+  const card = document.querySelector("#quota-user-body")?.closest(".card");
+  if (!data) { if (card) card.style.display = "none"; return; }
+  if (card) card.style.display = "";
+  renderQuotaRows(data.users || [], "quota-user-body", "user");
+  renderQuotaRows(data.directories || [], "quota-dir-body", "directory");
+}
+
+function editQuota(type, id) {
+  const isUser = type === "user";
+  promptDlg(isUser ? `设置用户配额 · ${id}` : `设置目录配额 · ${id}`, [
+    ...(isUser ? [] : [{ name: "path", label: "目录路径", value: id }]),
+    { name: "limit_mb", label: "上限（MiB；0 表示取消限额）", type: "number", value: "" },
+    { name: "note", label: "备注" },
+  ], async v => {
+    const limit = v.limit_mb === "" || +v.limit_mb === 0 ? 0 : Math.round(+v.limit_mb * 1024 * 1024);
+    const payload = isUser
+      ? { username: id, limit, note: v.note }
+      : { path: v.path || id, limit, note: v.note };
+    await api("POST", isUser ? "/api/quotas/user" : "/api/quotas/directory", payload);
+    toast("配额已更新", "ok");
+    loadAll();
+  });
+}
+
+async function clearQuota(type, id) {
+  if (type === "user") await api("DELETE", "/api/quotas/user/" + encodeURIComponent(id));
+  else await api("POST", "/api/quotas/directory/delete", { path: id });
+  toast("已取消限额", "ok");
+  loadAll();
+}
+
+document.getElementById("btn-quota-user").onclick = () => promptDlg("设置用户配额", [
+  { name: "username", label: "用户名", placeholder: "alice" },
+  { name: "limit_mb", label: "上限（MiB；0 表示取消限额）", type: "number" },
+  { name: "note", label: "备注" },
+], async v => {
+  const limit = v.limit_mb === "" || +v.limit_mb === 0 ? 0 : Math.round(+v.limit_mb * 1024 * 1024);
+  await api("POST", "/api/quotas/user", { username: v.username, limit, note: v.note });
+  toast("用户配额已更新", "ok"); loadAll();
+});
+document.getElementById("btn-quota-dir").onclick = () => promptDlg("设置目录配额", [
+  { name: "path", label: "目录路径", placeholder: "/data" },
+  { name: "limit_mb", label: "上限（MiB；0 表示取消限额）", type: "number" },
+  { name: "note", label: "备注" },
+], async v => {
+  const limit = v.limit_mb === "" || +v.limit_mb === 0 ? 0 : Math.round(+v.limit_mb * 1024 * 1024);
+  await api("POST", "/api/quotas/directory", { path: v.path, limit, note: v.note });
+  toast("目录配额已更新", "ok"); loadAll();
+});
+document.getElementById("btn-quota-refresh").onclick = () => loadAll().catch(e => toast(e.message, "bad"));
 
 initPage("stats.html", "存储统计").then(() => {
   loadAll().catch(e => toast("加载失败：" + e.message, "bad"));

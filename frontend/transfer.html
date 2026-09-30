@@ -26,6 +26,13 @@
       <!-- 未完成会话提示 -->
       <div class="card" id="resume-banner" style="display:none;border-color:var(--warn)"></div>
 
+      <div class="card" id="quota-card">
+        <div class="card-title">我的存储额度 <span class="hint">含回收站、历史版本和进行中上传预占</span>
+          <span class="spacer"></span><button class="btn xs ghost" id="quota-refresh">⟳</button>
+        </div>
+        <div id="quota-box" class="small muted">加载中…</div>
+      </div>
+
       <div class="grid cols-2">
         <!-- ================= 上传 ================= -->
         <div class="card">
@@ -133,6 +140,80 @@
 const { api, esc, fmtBytes, fmtDur, toast, modal, sha256Hex, getToken } = DFSVS;
 
 const CHAOS = () => document.getElementById("chaos-toggle").checked;
+
+async function loadQuota(path) {
+  try {
+    const q = await api("GET", "/api/quotas/me?path=" + encodeURIComponent(path || document.getElementById("up-path").value.trim() || "/"));
+    renderQuota(q);
+  } catch (e) {
+    document.getElementById("quota-box").textContent = "额度加载失败：" + e.message;
+  }
+}
+
+function quotaBlock(r) {
+  if (!r || r.limit == null) return "";
+  const ratio = Math.min(r.usage_ratio || 0, 1);
+  return `<div class="pbar thin"><i class="${r.over_limit ? "bad" : ratio > .85 ? "warn" : "ok"}" style="width:${(ratio * 100).toFixed(1)}%"></i></div>`;
+}
+
+function cleanupHtml(r) {
+  const c = r.cleanup || {};
+  const items = [];
+  (c.trash || []).slice(0, 3).forEach(t => items.push(`彻底删除回收站「${esc(t.name)}」可释放 ${fmtBytes(t.releasable_bytes)}`));
+  (c.history || []).slice(0, 3).forEach(h => items.push(`历史版本「${esc(h.path)}」独占 ${fmtBytes(h.size)}（需管理员压缩/清理）`));
+  if (!items.length && (c.active || []).length)
+    items.push("可先删除不需要的活动文件，再到回收站彻底清空");
+  return items.length ? `<div class="small muted">可清理：${items.map(esc).join("；")}</div>` : "";
+}
+
+function renderQuota(q) {
+  const rows = [q.user, ...(q.directories || []).filter(r => r.limit != null)];
+  if (!rows.length) {
+    document.getElementById("quota-box").innerHTML = `<span class="muted">当前用户与目标目录未设置上限。</span>`;
+    return;
+  }
+  document.getElementById("quota-box").innerHTML = `<div class="grid cols-${Math.min(3, rows.length)}" style="gap:10px">${rows.map(r => {
+    const name = r.scope === "user" ? `用户 ${esc(r.username)}` : `目录 ${esc(r.path)}`;
+    return `<div class="trace-box" style="padding:10px">
+      <div style="display:flex;justify-content:space-between;gap:8px"><b>${name}</b>
+        <span class="${r.over_limit ? "bad" : "muted"}">${r.limit == null ? "不限" : fmtBytes(r.used) + " / " + fmtBytes(r.limit)}</span></div>
+      ${quotaBlock(r)}
+      <div class="small muted">活动 ${fmtBytes(r.components.active)} · 回收站 ${fmtBytes(r.components.trash)} · 历史 ${fmtBytes(r.components.history)} · 预占 ${fmtBytes(r.components.reserved)}</div>
+      <div class="small ${r.over_limit ? "bad" : "muted"}">${r.over_limit ? `已超 ${fmtBytes(r.over)}，剩余 0` : `剩余 ${r.limit == null ? "不限" : fmtBytes(r.remaining)}`}</div>
+      ${r.over_limit ? cleanupHtml(r) : ""}
+    </div>`;
+  }).join("")}</div>`;
+}
+
+document.getElementById("quota-refresh").onclick = () => loadQuota();
+document.getElementById("up-path")?.addEventListener("change", () => loadQuota());
+
+function showQuotaError(data) {
+  const violations = data.violations || [];
+  const cleanup = data.cleanup || {};
+  const trash = cleanup.trash || [];
+  const history = cleanup.history || [];
+  const active = cleanup.active || [];
+  const body = `
+    <div class="trace-box" style="padding:12px;margin-bottom:10px">
+      ${violations.map(v => `
+        <div style="margin-bottom:8px">
+          <b class="bad">${v.scope === "user" ? "用户 " + esc(v.username) : "目录 " + esc(v.path)}</b>
+          超出 <b>${fmtBytes(v.over)}</b>；写入后将占用 <b>${fmtBytes(v.used)}</b>，
+          上限 ${v.limit == null ? "不限" : fmtBytes(v.limit)}，剩余 ${fmtBytes(v.remaining || 0)}。
+          <div class="small muted">活动 ${fmtBytes(v.components.active)} · 回收站 ${fmtBytes(v.components.trash)} · 历史版本 ${fmtBytes(v.components.history)} · 上传预占 ${fmtBytes(v.components.reserved)}</div>
+        </div>`).join("")}
+    </div>
+    <div class="small muted">建议先释放至少 ${fmtBytes(Math.max(...violations.map(v => v.over), 0))}：</div>
+    ${trash.length ? `<div class="card-title" style="font-size:13px;margin-top:10px">可立即释放：回收站</div>
+      <table class="tbl"><tbody>${trash.map(t => `<tr><td>${esc(t.name)}</td><td class="small muted">${esc(t.original_path)}</td><td class="right">${fmtBytes(t.releasable_bytes)}</td></tr>`).join("")}</tbody></table>
+      <a class="btn sm danger" href="recycle.html" style="margin-top:8px">前往回收站彻底清理</a>` : ""}
+    ${history.length ? `<div class="card-title" style="font-size:13px;margin-top:10px">历史版本独占数据</div>
+      <table class="tbl"><tbody>${history.map(h => `<tr><td class="mono small">${esc(h.path)}</td><td class="right">${fmtBytes(h.size)}</td></tr>`).join("")}</tbody></table>
+      <div class="small muted">删除活动文件不会释放仍被提交快照引用的版本，需要管理员压缩/清理版本历史。</div>` : ""}
+    ${!trash.length && !history.length && active.length ? `<div class="small" style="margin-top:10px">删除活动文件后还需到回收站“彻底删除”；若文件已提交过，还需清理对应历史版本。</div>` : ""}`;
+  DFSVS.modal({ title: "上传已拦截：存储空间超限", body, okText: "我知道了", hideCancel: true });
+}
 
 // 混沌模式开关同步到服务端（上传随机失败）
 document.getElementById("chaos-toggle").onchange = async (e) => {
@@ -310,7 +391,9 @@ async function startUpload(existingSession) {
     const all2 = lsGet(); delete all2[lsKey(upFile)]; lsSet(all2);
     finishUpload("完成", true, r);
   } catch (e) {
+    if (e.status === 507 && e.data?.code === "QUOTA_EXCEEDED") showQuotaError(e.data);
     finishUpload("失败：" + e.message, false);
+    loadQuota();
   }
 }
 
@@ -333,6 +416,7 @@ function finishUpload(msg, ok, result) {
       </div>`;
     toast(`上传完成：${f.path}`, "ok");
     loadSessions();
+    loadQuota();
   } else if (!ok) {
     toast(msg, "bad", 5000);
   }
@@ -533,7 +617,9 @@ initPage("transfer.html", "上传下载").then(() => {
   const p = DFSVS.qs("path");
   if (p) { document.getElementById("dl-path").value = p; document.getElementById("dl-query").click(); }
   loadSessions();
+  loadQuota("/");
   DFSVS.poll(loadSessions, 5000);
+  DFSVS.poll(() => loadQuota(), 8000);
 });
 </script>
 </body>

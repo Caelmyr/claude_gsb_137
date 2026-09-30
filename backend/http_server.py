@@ -27,6 +27,7 @@ from . import config, diff_engine
 from .auth import AuthError
 from .filesystem import FsError
 from .namenode import MissingBlockError, NNError
+from .quota import QuotaError, QuotaExceeded
 from .util import (content_range_value, decode_text, now, parse_range,
                    sha256_bytes, short_hash, to_rate_units)
 from .versioning import VersionError
@@ -655,6 +656,72 @@ def api_stats_timeline(ctx):
 
 
 # ============================================================================
+# API: 存储配额
+# ============================================================================
+
+@route("GET", "/api/quotas", cap="admin")
+def api_quotas_overview(ctx):
+    return ctx.nn.quotas.overview()
+
+
+@route("GET", "/api/quotas/me")
+def api_quotas_me(ctx):
+    return ctx.nn.quotas.my_status(ctx.user, ctx.query.get("path", "/"))
+
+
+@route("GET", "/api/quotas/user/<name>", cap="admin")
+def api_quota_get_user(ctx):
+    return ctx.nn.quotas.get_quota("user", ctx.params["name"])
+
+
+@route("GET", "/api/quotas/directory", cap="admin")
+def api_quota_get_directory(ctx):
+    return ctx.nn.quotas.get_quota("directory", ctx.query.get("path", "/"))
+
+
+@route("POST", "/api/quotas/user", cap="admin")
+def api_quota_set_user(ctx):
+    body = ctx.json()
+    row = ctx.nn.quotas.set_user_quota(body.get("username", ""),
+                                      body.get("limit"), ctx.actor(),
+                                      body.get("note", ""))
+    ctx.nn.log_event("INFO", "quota", "user_quota_set",
+                     body.get("username", ""), ctx.actor(),
+                     f"limit={row.get('limit')}")
+    return {"ok": True, "quota": row}
+
+
+@route("POST", "/api/quotas/directory", cap="admin")
+def api_quota_set_directory(ctx):
+    body = ctx.json()
+    row = ctx.nn.quotas.set_directory_quota(body.get("path", "/"),
+                                            body.get("limit"), ctx.actor(),
+                                            body.get("note", ""))
+    ctx.nn.log_event("INFO", "quota", "dir_quota_set",
+                     body.get("path", "/"), ctx.actor(),
+                     f"limit={row.get('limit')}")
+    return {"ok": True, "quota": row}
+
+
+@route("DELETE", "/api/quotas/user/<name>", cap="admin")
+def api_quota_delete_user(ctx):
+    ctx.nn.quotas.delete_quota("user", ctx.params["name"])
+    ctx.nn.log_event("WARN", "quota", "quota_delete",
+                     f"user:{ctx.params['name']}", ctx.actor(), "取消限额")
+    return {"ok": True}
+
+
+@route("POST", "/api/quotas/directory/delete", cap="admin")
+def api_quota_delete_directory(ctx):
+    body = ctx.json()
+    path = body.get("path", "/")
+    ctx.nn.quotas.delete_quota("directory", path)
+    ctx.nn.log_event("WARN", "quota", "quota_delete",
+                     f"directory:{path}", ctx.actor(), "取消限额")
+    return {"ok": True}
+
+
+# ============================================================================
 # API: 用户管理
 # ============================================================================
 
@@ -1028,6 +1095,10 @@ class NameNodeHandler(BaseHTTPRequestHandler):
                 self._send_json(result)
         except ApiError as e:
             self._send_json({"error": e.message}, e.status)
+        except QuotaExceeded as e:
+            self._send_json(e.payload, e.status)
+        except QuotaError as e:
+            self._send_json({"error": str(e)}, 400)
         except AuthError as e:
             self._send_json({"error": str(e)}, 403)
         except MissingBlockError as e:

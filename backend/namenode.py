@@ -33,6 +33,7 @@ from . import chunking, config
 from .auth import AuthManager, PermissionManager
 from .filesystem import FsError, VirtualFS
 from .metadata import MetadataStore
+from .quota import QuotaExceeded, QuotaManager
 from .util import (HttpError, LRU, RateCounter, RingBuffer, b64e, gen_id,
                    guess_mime, hour_key, http_json, http_request,
                    is_text_mime, needs_recovery, canonical_access_op,
@@ -68,6 +69,7 @@ class NameNode:
         self.fs = VirtualFS(self.meta)
         self.auth = AuthManager(self.meta)
         self.perms = PermissionManager(self.meta, self.auth)
+        self.quotas = QuotaManager(self)
         self.versions = VersionStore(self)
 
         # ---- 节点注册表（内存态；摘要持久化到 cluster 文档） ----
@@ -105,6 +107,7 @@ class NameNode:
         self.fs.init_root()
         self.auth.ensure_seed()
         self.perms.ensure_seed()
+        self.quotas.init_doc()
         self.versions.ensure_head()
         self._init_blocks_doc()
         self._init_stats_doc()
@@ -1001,11 +1004,15 @@ class NameNode:
                     return self._session_view(sess)
             if len(self.sessions) >= config.UPLOAD_SESSION_MAX:
                 raise NNError("上传会话过多，请稍后再试")
-            sess_id = session_id or gen_id("up")
+            sess_id = session_id if session_id is not None else gen_id("up")
+            piece = piece_size or config.UPLOAD_PIECE_SIZE
+            size = max(0, int(size or 0))
+            total_pieces = max(1, (size + piece - 1) // piece) if size else 1
+            # 新建上传在接收任何数据前预占完整文件额度；恢复旧会话不重复检查，
+            # 最终 complete 时仍会按当时的最新限额复核。
+            self.quotas.evaluate_write(path, filename, size, user, sess_id)
             stage_dir = os.path.join(config.SESSION_DIR, sess_id)
             os.makedirs(stage_dir, exist_ok=True)
-            piece = piece_size or config.UPLOAD_PIECE_SIZE
-            total_pieces = max(1, (size + piece - 1) // piece) if size else 1
             sess = {
                 "id": sess_id, "path": path, "filename": filename,
                 "size": size, "piece_size": piece,
@@ -1080,38 +1087,49 @@ class NameNode:
                               f"{missing[:10]}")
             if sess["completed"]:
                 return sess["result"]
-        # 读取全部分片 -> 拼接 -> 校验总大小
-        datas = []
-        for i in range(sess["total_pieces"]):
-            piece_path = os.path.join(sess["stage_dir"], f"piece_{i:06d}")
-            with open(piece_path, "rb") as f:
-                datas.append(f.read())
-        data = b"".join(datas)
-        if sess["size"] and len(data) != sess["size"]:
-            raise NNError(f"拼接后大小不符: {len(data)} != {sess['size']}")
-        t0 = now()
-        full_path = sess["path"].rstrip("/") + "/" + sess["filename"]
-        info = self.write_file_internal(full_path, data, user)
-        elapsed = now() - t0
-        result = {
-            "ok": True, "file": info, "elapsed_s": round(elapsed, 3),
-            "throughput_mbps": round(len(data) / max(elapsed, 1e-6) / 1e6, 2),
-            "pieces": sess["total_pieces"],
-            "blocks": info["chunks"],
-            "dedup_hits": info["dedup_hits"],
-        }
-        with self.session_lock:
-            sess["completed"] = True
-            sess["result"] = result
-        self._cleanup_session_dir(sess)
-        self.log_event("INFO", "upload", "complete", full_path, user,
-                       f"{len(data)} 字节 / {sess['total_pieces']} 分片 / "
-                       f"{info['chunks']} 块 / 去重命中 {info['dedup_hits']} / "
-                       f"{result['elapsed_s']}s")
-        self.emit("upload_complete",
-                  f"{sess['filename']} 上传完成（{len(data)} B, "
-                  f"{info['chunks']} 块）", path=full_path)
-        return result
+            if sess.get("committing"):
+                raise NNError("该上传会话正在提交，请稍候")
+            sess["committing"] = True
+        self.quotas.evaluate_write(sess["path"], sess["filename"], sess["size"],
+                                   sess.get("user", user),
+                                   exclude_session=sess["id"])
+        try:
+            # 读取全部分片 -> 拼接 -> 校验总大小
+            datas = []
+            for i in range(sess["total_pieces"]):
+                piece_path = os.path.join(sess["stage_dir"], f"piece_{i:06d}")
+                with open(piece_path, "rb") as f:
+                    datas.append(f.read())
+            data = b"".join(datas)
+            if sess["size"] and len(data) != sess["size"]:
+                raise NNError(f"拼接后大小不符: {len(data)} != {sess['size']}")
+            t0 = now()
+            full_path = sess["path"].rstrip("/") + "/" + sess["filename"]
+            info = self.write_file_internal(full_path, data, user)
+            elapsed = now() - t0
+            result = {
+                "ok": True, "file": info, "elapsed_s": round(elapsed, 3),
+                "throughput_mbps": round(len(data) / max(elapsed, 1e-6) / 1e6, 2),
+                "pieces": sess["total_pieces"],
+                "blocks": info["chunks"],
+                "dedup_hits": info["dedup_hits"],
+            }
+            with self.session_lock:
+                sess["completed"] = True
+                sess["result"] = result
+            self._cleanup_session_dir(sess)
+            self.log_event("INFO", "upload", "complete", full_path, user,
+                           f"{len(data)} 字节 / {sess['total_pieces']} 分片 / "
+                           f"{info['chunks']} 块 / 去重命中 {info['dedup_hits']} / "
+                           f"{result['elapsed_s']}s")
+            self.emit("upload_complete",
+                      f"{sess['filename']} 上传完成（{len(data)} B, "
+                      f"{info['chunks']} 块）", path=full_path)
+            return result
+        except Exception:
+            with self.session_lock:
+                sess["committing"] = False
+            raise
 
     def _cleanup_session_dir(self, sess):
         import shutil

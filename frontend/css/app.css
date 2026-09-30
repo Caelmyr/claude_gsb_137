@@ -263,10 +263,11 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
   background: linear-gradient(90deg, var(--accent), var(--accent-2));
   transition: width .25s;
 }
-.pbar.ok > i { background: linear-gradient(90deg, #239c5c, var(--ok)); }
-.pbar.warn > i { background: linear-gradient(90deg, #c07f22, var(--warn)); }
-.pbar.bad > i { background: linear-gradient(90deg, #b03a34, var(--bad)); }
+.pbar.ok > i, .pbar > i.ok { background: linear-gradient(90deg, #239c5c, var(--ok)); }
+.pbar.warn > i, .pbar > i.warn { background: linear-gradient(90deg, #c07f22, var(--warn)); }
+.pbar.bad > i, .pbar > i.bad { background: linear-gradient(90deg, #b03a34, var(--bad)); }
 .pbar.thin { height: 5px; }
+tr.row-danger { background: rgba(229,83,75,.08); }
 
 /* ---------------------------------------------------------------- 弹窗 */
 .modal-mask {

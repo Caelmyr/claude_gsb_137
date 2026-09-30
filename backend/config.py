@@ -97,6 +97,7 @@ META_DOCS = [
     "blocks",      # 块表：块 -> 校验和 / genstamp / 副本位置
     "versions",    # 版本树：commit DAG / 分支 / HEAD
     "users",       # 用户与凭据
+    "quotas",      # 用户 / 目录存储配额
     "perms",       # 权限规则（ACL）
     "logs",        # 系统审计日志
     "recycle",     # 回收站条目
