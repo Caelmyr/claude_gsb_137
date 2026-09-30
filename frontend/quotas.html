@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>存储配额 · DFSVS</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar" class="sidebar"></aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">存储配额</h1>
+        <div class="sub" id="page-sub">用户上限 · 目录上限 · 已用空间含活动文件 + 回收站 + 历史版本</div>
+      </div>
+      <div class="spacer"></div>
+      <label class="checkbox small"><input type="checkbox" id="auto-refresh" checked> 自动刷新</label>
+      <button class="btn sm ghost" id="btn-refresh">⟳ 刷新</button>
+      <div class="userchip" id="userchip"></div>
+    </header>
+
+    <section class="content">
+      <div id="no-perm" class="card" style="display:none">
+        <div class="empty"><div class="big">🔒</div>当前账号没有配额管理权限（需要 admin 角色）</div>
+      </div>
+
+      <div id="main-pane">
+        <!-- 概览 KPI -->
+        <div class="grid cols-4" id="kpi-row" style="margin-bottom:16px"></div>
+
+        <!-- 我的配额（任何登录用户都能看，admin 自查） -->
+        <div class="card" style="margin-bottom:16px">
+          <div class="card-title">📦 我的存储额度
+            <span class="hint">超限时上传会被拦截，并提示可清理的回收站/历史版本数据</span></div>
+          <div id="mine-box"></div>
+        </div>
+
+        <!-- 用户配额 -->
+        <div class="card">
+          <div class="card-title">用户配额 <span class="hint" id="user-count"></span>
+            <span class="spacer"></span>
+            <button class="btn xs primary" id="btn-add-user-quota">＋ 为用户设置上限</button>
+          </div>
+          <div class="table-wrap"><table class="tbl">
+            <thead><tr>
+              <th>用户</th><th>状态</th><th style="min-width:280px">已用 / 上限（剩余）</th>
+              <th class="right">活动文件</th><th class="right">回收站</th><th class="right">历史版本</th>
+              <th>备注</th><th>操作</th>
+            </tr></thead>
+            <tbody id="user-body"></tbody>
+          </table></div>
+        </div>
+
+        <!-- 目录配额 -->
+        <div class="card">
+          <div class="card-title">目录配额 <span class="hint">作用于该目录前缀及全部子路径；回收站条目计入删除者用户配额</span>
+            <span class="spacer"></span>
+            <button class="btn xs primary" id="btn-add-dir-quota">＋ 为目录设置上限</button>
+          </div>
+          <div class="table-wrap"><table class="tbl">
+            <thead><tr>
+              <th>目录</th><th>状态</th><th style="min-width:280px">已用 / 上限（剩余）</th>
+              <th class="right">活动文件</th><th class="right">历史版本</th>
+              <th>备注</th><th>最近调整</th><th>操作</th>
+            </tr></thead>
+            <tbody id="dir-body"></tbody>
+          </table></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">计量口径说明</div>
+          <div class="small dim" style="line-height:1.9">
+            · 配额用量 = <b>活动文件 ∪ 回收站 ∪ 全部历史提交快照</b> 引用到的内容，
+            按内容哈希（content_hash）<b>去重</b>后取逻辑字节和；同一份内容被多处引用只计一次。<br>
+            · 因此「删了文件进回收站」「旧版本仍在提交历史里」都不会释放额度——
+            彻底清空回收站 / 清理版本历史后才释放，避免出现"删了文件仍被判超限"或"超了还能继续写"。<br>
+            · 上传做两道拦截：<span class="mono">upload/begin</span> 按声明大小预判（分片不接收）；
+            <span class="mono">upload/complete</span> 拿到真实哈希、数据落盘前权威复核（精确处理覆盖与去重）。<br>
+            · 上限为 <b>0</b> 表示不限制；目录配额作用于前缀，祖先与后代配额需同时满足。
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toasts"></div>
+<script src="js/app.js"></script>
+<script>
+"use strict";
+const { api, esc, fmtBytes, fmtTs, fmtAgo, toast, modal, confirmDlg, promptDlg,
+        quotaBar, quotaLevelClass, quotaLevelText, quotaCard, quotaCleanupHtml } = DFSVS;
+
+let overview = null;
+
+async function loadAll() {
+  try {
+    const [ov, me] = await Promise.all([
+      api("GET", "/api/quotas"),
+      api("GET", "/api/quotas/me"),
+    ]);
+    overview = ov;
+    document.getElementById("no-perm").style.display = "none";
+    document.getElementById("main-pane").style.display = "";
+    renderKpis(ov);
+    renderMine(me);
+    renderUsers(ov.users);
+    renderDirs(ov.dirs);
+  } catch (e) {
+    if (e.status === 403) {
+      document.getElementById("no-perm").style.display = "";
+      document.getElementById("main-pane").style.display = "none";
+    } else toast("加载失败：" + e.message, "bad");
+  }
+}
+
+function renderKpis(ov) {
+  const limited = [...ov.users, ...ov.dirs].filter(v => v.limited);
+  const exceeded = ov.counts.exceeded || 0;
+  const warning = ov.counts.warning || 0;
+  const cells = [
+    { label: "已超限", value: exceeded, cls: exceeded ? "bad" : "ok",
+      sub: "上传将被拦截" },
+    { label: "接近上限", value: warning, cls: warning ? "warn" : "ok",
+      sub: `使用率 ≥ ${(ov.warn_ratio * 100) | 0}%` },
+    { label: "已设用户配额", value: ov.users.filter(u => u.limited).length,
+      sub: `共 ${ov.users.length} 个用户`, cls: "accent" },
+    { label: "已设目录配额", value: ov.dirs.filter(d => d.limited).length,
+      sub: "按目录前缀生效", cls: "" },
+  ];
+  document.getElementById("kpi-row").innerHTML = cells.map(c => `
+    <div class="kpi ${c.cls}">
+      <div class="k-label">${esc(c.label)}</div>
+      <div class="k-value">${c.value}</div>
+      <div class="k-sub">${esc(c.sub)}</div>
+    </div>`).join("");
+}
+
+function renderMine(me) {
+  document.getElementById("mine-box").innerHTML = `
+    <div style="max-width:560px">
+      ${quotaCard(me)}
+      <div style="margin-top:10px">${quotaCleanupHtml(me.cleanup)}</div>
+    </div>`;
+}
+
+function renderUsers(users) {
+  document.getElementById("user-count").textContent = users.length + " 个用户";
+  const body = document.getElementById("user-body");
+  if (!users.length) {
+    body.innerHTML = `<tr><td colspan="8" class="empty">暂无用户</td></tr>`;
+    return;
+  }
+  body.innerHTML = users.map(u => `
+    <tr>
+      <td><b>${esc(u.user)}</b></td>
+      <td><span class="badge ${quotaLevelClass(u.level)} plain">${esc(quotaLevelText(u.level))}</span></td>
+      <td>${quotaBar(u)}</td>
+      <td class="num right">${fmtBytes(u.breakdown.active)}</td>
+      <td class="num right ${u.breakdown.trash ? "q-warn" : ""}">${fmtBytes(u.breakdown.trash)}</td>
+      <td class="num right ${u.breakdown.history ? "" : "dim"}">${fmtBytes(u.breakdown.history)}</td>
+      <td class="small dim">${esc(u.note || "-")}</td>
+      <td class="nowrap">
+        <button class="btn xs u-detail" data-u="${esc(u.user)}">明细</button>
+        <button class="btn xs u-edit" data-u="${esc(u.user)}" data-lim='${esc(JSON.stringify(u.limit_bytes))}'>
+          ${u.limited ? "✎ 调整" : "＋ 设限"}</button>
+        ${u.limited ? `<button class="btn xs danger u-clear" data-u="${esc(u.user)}">取消</button>` : ""}
+      </td>
+    </tr>`).join("");
+
+  body.querySelectorAll(".u-edit").forEach(b => b.onclick = () =>
+    editUserQuota(b.dataset.u, JSON.parse(b.dataset.lim)));
+  body.querySelectorAll(".u-clear").forEach(b => b.onclick = () =>
+    confirmDlg(`取消用户 ${b.dataset.u} 的存储上限？`, async () => {
+      try { await api("DELETE", "/api/quotas/users/" + encodeURIComponent(b.dataset.u));
+            toast("已取消配额", "ok"); loadAll(); }
+      catch (e) { toast(e.message, "bad"); }
+    }));
+  body.querySelectorAll(".u-detail").forEach(b => b.onclick = () =>
+    showUserDetail(b.dataset.u));
+}
+
+function renderDirs(dirs) {
+  const body = document.getElementById("dir-body");
+  if (!dirs.length) {
+    body.innerHTML = `<tr><td colspan="8" class="empty">
+      尚未为任何目录设置配额，点右上角「为目录设置上限」</td></tr>`;
+    return;
+  }
+  body.innerHTML = dirs.map(d => `
+    <tr>
+      <td><b class="mono">${esc(d.path)}</b></td>
+      <td><span class="badge ${quotaLevelClass(d.level)} plain">${esc(quotaLevelText(d.level))}</span></td>
+      <td>${quotaBar(d)}</td>
+      <td class="num right">${fmtBytes(d.breakdown.active)}</td>
+      <td class="num right ${d.breakdown.history ? "" : "dim"}">${fmtBytes(d.breakdown.history)}</td>
+      <td class="small dim">${esc(d.note || "-")}</td>
+      <td class="small dim nowrap">${d.updated_at ? `${esc(d.updated_by || "-")} · ${fmtAgo(d.updated_at)}` : "-"}</td>
+      <td class="nowrap">
+        <button class="btn xs d-edit" data-p="${esc(d.path)}" data-lim='${esc(JSON.stringify(d.limit_bytes))}'>✎ 调整</button>
+        <button class="btn xs danger d-clear" data-p="${esc(d.path)}">取消</button>
+      </td>
+    </tr>`).join("");
+  body.querySelectorAll(".d-edit").forEach(b => b.onclick = () =>
+    editDirQuota(b.dataset.p, JSON.parse(b.dataset.lim)));
+  body.querySelectorAll(".d-clear").forEach(b => b.onclick = () =>
+    confirmDlg(`取消目录 ${b.dataset.p} 的配额？`, async () => {
+      try { await api("POST", "/api/quotas/dirs/remove", { path: b.dataset.p });
+            toast("已取消目录配额", "ok"); loadAll(); }
+      catch (e) { toast(e.message, "bad"); }
+    }));
+}
+
+// ------------------------------------------------------------ 编辑对话框
+function limitFields(prefill) {
+  return [
+    { name: "limit_bytes", label: "上限（字节，0 = 不限制；也可填 500MiB / 2GiB / 1.5GB 等）",
+      value: prefill ? String(prefill) : "0",
+      placeholder: "如 104857600（100 MiB）" },
+    { name: "note", label: "备注", type: "text", value: "" },
+  ];
+}
+
+function parseLimitInput(s) {
+  if (typeof s === "number") return s;
+  s = String(s).trim();
+  if (!s) return 0;
+  const m = s.match(/^([\d.]+)\s*(Ki?B|Mi?B|Gi?B|Ti?B|KB|MB|GB|TB|B)?$/i);
+  if (!m) throw new Error("无法解析的容量：" + s);
+  const n = parseFloat(m[1]);
+  const unit = (m[2] || "B").toUpperCase();
+  const mult = { B: 1, KIB: 1024, KB: 1024, MIB: 1024 ** 2, MB: 1024 ** 2,
+                 GIB: 1024 ** 3, GB: 1024 ** 3, TIB: 1024 ** 4, TB: 1024 ** 4 };
+  return Math.round(n * mult[unit]);
+}
+
+function editUserQuota(username, current) {
+  promptDlg(`设置用户配额 · ${username}`, limitFields(current), async (v) => {
+    let lim;
+    try { lim = parseLimitInput(v.limit_bytes); }
+    catch (e) { toast(e.message, "bad"); return false; }
+    try {
+      await api("POST", "/api/quotas/users/" + encodeURIComponent(username),
+                { limit_bytes: lim, note: v.note });
+      toast(`已更新 ${username} 的配额`, "ok");
+      loadAll();
+    } catch (e) { toast(e.message, "bad"); return false; }
+  });
+}
+
+async function pickDir() {
+  const tree = await api("GET", "/api/fs/tree");
+  const dirs = [];
+  (function walk(n, p) {
+    const cp = p === "/" ? "" : p;
+    if (n.type === "dir") {
+      const full = cp + (n.name === "/" ? "" : "/" + n.name);
+      dirs.push(full || "/");
+      (n.children || []).forEach(c => walk(c, full === "/" ? "" : full));
+    }
+  })(tree.tree, "/");
+  return new Promise(resolve => {
+    const body = document.createElement("div");
+    body.innerHTML = `<div class="scroll-y" style="max-height:56vh">${dirs.map((p, i) => `
+      <div class="t-node dir-pick" data-i="${i}" style="padding:6px 8px;cursor:pointer">
+        <span>🗀</span> <span class="mono small">${esc(p)}</span></div>`).join("")}</div>`;
+    const m = modal({ title: "选择目录", body, wide: true, okText: "取消", hideCancel: true });
+    body.querySelectorAll(".dir-pick").forEach(el => el.onclick = () => {
+      m.close(); resolve(dirs[+el.dataset.i]);
+    });
+  });
+}
+
+function editDirQuota(path, current) {
+  const open = (p) => promptDlg(`设置目录配额 · ${p}`, limitFields(current), async (v) => {
+    let lim;
+    try { lim = parseLimitInput(v.limit_bytes); }
+    catch (e) { toast(e.message, "bad"); return false; }
+    try {
+      await api("POST", "/api/quotas/dirs",
+                { path: p, limit_bytes: lim, note: v.note });
+      toast(`已更新目录 ${p} 的配额`, "ok");
+      loadAll();
+    } catch (e) { toast(e.message, "bad"); return false; }
+  });
+  open(path);
+}
+
+document.getElementById("btn-add-dir-quota").onclick = async () => {
+  const p = await pickDir();
+  if (p) editDirQuota(p, null);
+};
+
+document.getElementById("btn-add-user-quota").onclick = () => {
+  const names = (overview?.users || []).map(u => u.user);
+  promptDlg("为用户设置存储上限", [
+    { name: "username", label: "用户名", type: "select",
+      options: names.map(n => ({ value: n, label: n })) },
+    { name: "limit_bytes", label: "上限（字节，0 = 不限制；支持 MiB/GiB）", value: "0" },
+    { name: "note", label: "备注", value: "" },
+  ], async (v) => {
+    let lim;
+    try { lim = parseLimitInput(v.limit_bytes); }
+    catch (e) { toast(e.message, "bad"); return false; }
+    try {
+      await api("POST", "/api/quotas/users/" + encodeURIComponent(v.username),
+                { limit_bytes: lim, note: v.note });
+      toast("已设置", "ok"); loadAll();
+    } catch (e) { toast(e.message, "bad"); return false; }
+  });
+};
+
+// ------------------------------------------------------------ 用户明细弹窗
+async function showUserDetail(username) {
+  try {
+    const v = await api("GET", "/api/quotas/users/" + encodeURIComponent(username));
+    const body = document.createElement("div");
+    body.innerHTML = `
+      ${quotaCard(v)}
+      <div style="margin-top:12px"><b>占用构成（去重后逻辑字节）</b>
+        <table class="tbl" style="margin-top:6px">
+          <thead><tr><th>来源</th><th class="right">字节</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>活动文件</td><td class="num right">${fmtBytes(v.breakdown.active)}</td>
+              <td class="small dim">文件树中可见的文件</td></tr>
+            <tr><td>回收站</td><td class="num right">${fmtBytes(v.breakdown.trash)}</td>
+              <td class="small dim">已删除但未彻底清除，清空回收站即释放</td></tr>
+            <tr><td>历史版本</td><td class="num right">${fmtBytes(v.breakdown.history)}</td>
+              <td class="small dim">全部提交快照引用的旧内容，受 GC 保护</td></tr>
+            ${v.breakdown.shared ? `<tr><td>跨来源重复（去重扣减）</td>
+              <td class="num right">-${fmtBytes(v.breakdown.shared)}</td>
+              <td class="small dim">同一内容被多来源引用，只计一次</td></tr>` : ""}
+          </tbody>
+        </table>
+      </div>
+      <hr class="hr">
+      <div><b>可清理数据</b><div style="margin-top:6px">${quotaCleanupHtml(v.cleanup)}</div></div>`;
+    modal({ title: `配额明细 · ${username}`, body, wide: true,
+            hideCancel: true, okText: "关闭" });
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+document.getElementById("btn-refresh").onclick = loadAll;
+
+let stopPoll = null;
+initPage("quotas.html", "存储配额").then(() => {
+  loadAll();
+  stopPoll = DFSVS.poll(() => {
+    if (document.getElementById("auto-refresh").checked) return loadAll();
+  }, 5000);
+});
+</script>
+</body>
+</html>

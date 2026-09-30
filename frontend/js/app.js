@@ -213,6 +213,7 @@ const DFSVS = (() => {
     ]},
     { group: "管理", items: [
       { href: "users.html", ico: "👤", name: "用户管理" },
+      { href: "quotas.html", ico: "📦", name: "存储配额" },
       { href: "permissions.html", ico: "🔑", name: "权限设置" },
     ]},
   ];
@@ -521,12 +522,140 @@ const DFSVS = (() => {
     return new URLSearchParams(location.search).get(name) || def;
   }
 
+  // -------------------------------------------------------------- 配额
+  function quotaLevelClass(level) {
+    return level === "exceeded" ? "bad" : level === "warning" ? "warn"
+      : level === "unlimited" ? "dim" : "ok";
+  }
+
+  function quotaLevelText(level) {
+    return { exceeded: "已超限", warning: "接近上限", ok: "正常",
+             unlimited: "不限" }[level] || level;
+  }
+
+  /** 用量水位条：已用/上限/剩余，含回收站与历史版本口径。 */
+  function quotaBar(v, { compact = false } = {}) {
+    if (!v) return "";
+    const lim = v.limit_bytes;
+    if (!lim) {
+      return `<div class="quota-bar-row">
+        <div class="pbar thin"><i style="width:0%"></i></div>
+        <span class="mono small dim">${esc(fmtBytes(v.used_bytes))} / 不限</span></div>`;
+    }
+    const pct = Math.min(100, v.used_bytes / lim * 100);
+    const cls = v.level === "exceeded" ? "bad" : v.level === "warning" ? "warn" : "ok";
+    return `<div class="quota-bar-row">
+      <div class="pbar thin ${cls}" title="活动 ${fmtBytes(v.breakdown.active)} · 回收站 ${fmtBytes(v.breakdown.trash)} · 历史版本 ${fmtBytes(v.breakdown.history)}">
+        <i style="width:${pct.toFixed(1)}%"></i></div>
+      <span class="mono small q-${cls}">${esc(fmtBytes(v.used_bytes))} / ${esc(fmtBytes(lim))}
+        ${compact ? "" : `· 剩 ${esc(fmtBytes(Math.max(0, lim - v.used_bytes)))}`}</span></div>`;
+  }
+
+  /**
+   * 把结构化的配额裁决/自查结果渲染成 HTML 卡片块。
+   * v: 单个 scope 视图（user 或 dir）
+   */
+  function quotaCard(v) {
+    if (!v) return "";
+    const lim = v.limit_bytes;
+    const cls = quotaLevelClass(v.level);
+    const head = v.scope === "user"
+      ? `👤 <b>${esc(v.user)}</b>` : `🗀 <span class="mono">${esc(v.path)}</span>`;
+    return `<div class="quota-card qcard-${cls}">
+      <div class="qc-head">${head}
+        <span class="badge ${cls} plain">${esc(quotaLevelText(v.level))}</span></div>
+      ${quotaBar(v)}
+      <div class="qc-break small dim">
+        活动文件 <b>${esc(fmtBytes(v.breakdown.active))}</b> ·
+        回收站 <b>${esc(fmtBytes(v.breakdown.trash))}</b> ·
+        历史版本 <b>${esc(fmtBytes(v.breakdown.history))}</b>
+        ${v.breakdown.shared ? `· 重复引用已去重 <b>${esc(fmtBytes(v.breakdown.shared))}</b>` : ""}
+      </div></div>`;
+  }
+
+  /** 可清理项（回收站条目 + 仅历史版本引用的内容）。 */
+  function quotaCleanupHtml(c) {
+    if (!c) return "";
+    let html = "";
+    if (c.trash_items && c.trash_items.length) {
+      html += `<div class="small" style="margin:6px 0">可立即清理的回收站条目：</div>
+        <table class="tbl sm"><thead><tr><th>名称</th><th>原路径</th><th class="right">大小</th></tr></thead><tbody>
+        ${c.trash_items.map(i => `<tr>
+          <td>🗎 ${esc(i.name)}${i.files > 1 ? ` <span class="badge dim plain">${i.files} 文件</span>` : ""}</td>
+          <td class="mono small dim">${esc(i.original_path || "")}</td>
+          <td class="num right">${fmtBytes(i.size)}</td></tr>`).join("")}
+        </tbody></table>
+        ${c.trash_more ? `<div class="small dim">…另有 ${c.trash_more} 项</div>` : ""}
+        <div class="small" style="margin-top:4px">回收站条目合计 <b>${fmtBytes(c.trash_total)}</b>，
+          前往 <a href="recycle.html">回收站</a> 彻底删除即可释放。</div>`;
+    } else {
+      html += `<div class="small dim" style="margin:6px 0">回收站里没有可立即清理的条目。</div>`;
+    }
+    if (c.history_only_bytes > 0) {
+      html += `<div class="small" style="margin-top:8px">另有
+        <b>${fmtBytes(c.history_only_bytes)}</b>（${c.history_only_items} 个唯一内容）
+        仅被历史提交快照引用、活动文件与回收站中均已不存在。
+        这部分空间受版本历史保护，需通过版本管理清理（重置分支 / 删除提交）后由 GC 回收。</div>`;
+    }
+    return html;
+  }
+
+  /**
+   * 上传等写操作超限时的专用弹窗：清楚告知超了多少、占用构成、能清理什么。
+   * verdict: /api/quotas/check 的单条 violation，或 413 响应里的 verdict。
+   */
+  function showQuotaExceeded(violation) {
+    const isUser = violation.scope === "user";
+    const title = isUser ? "🚫 存储空间不足，上传已拦截" : "🚫 目录配额不足，上传已拦截";
+    const body = document.createElement("div");
+    body.innerHTML = `
+      <div class="quota-exceed-box">
+        <div class="qe-amount">
+          写入后将占用 <b class="mono">${fmtBytes(violation.projected_bytes)}</b>，
+          上限 <b class="mono">${fmtBytes(violation.limit_bytes)}</b>，
+          <b class="text-bad">超出 ${fmtBytes(violation.over_bytes)}</b>
+        </div>
+        <div class="qe-bar">${quotaBar(violation)}</div>
+        <div class="qe-break">
+          <span class="chip">活动 ${fmtBytes(violation.breakdown.active)}</span>
+          <span class="chip">回收站 ${fmtBytes(violation.breakdown.trash)}</span>
+          <span class="chip">历史版本 ${fmtBytes(violation.breakdown.history)}</span>
+          ${violation.reclaimed_bytes ? `<span class="chip ok">覆盖可释放 ${fmtBytes(violation.reclaimed_bytes)}</span>` : ""}
+        </div>
+        <hr class="hr">
+        <div class="qe-cleanup"><b>可以清理的数据：</b>${isUser ? quotaCleanupHtml(violation.cleanup) :
+          `<div class="small dim" style="margin-top:6px">目录配额不单独统计回收站；可改写到其它目录，或联系管理员调整该目录上限。</div>`}
+        </div>
+      </div>`;
+    modal({
+      title, body, hideCancel: true, okText: "我知道了", wide: true,
+    });
+  }
+
+  /**
+   * 包裹一次写操作：遇到 413 + quota_exceeded 时弹结构化配额弹窗，
+   * 其余错误走普通 toast。返回 {quotaBlocked: bool, error}。
+   */
+  async function withQuotaGuard(fn) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (e.status === 413 && e.data && e.data.quota_exceeded && e.data.verdict) {
+        showQuotaExceeded(e.data.verdict);
+        return { quotaBlocked: true, error: e };
+      }
+      throw e;
+    }
+  }
+
   return {
     api, getToken, setToken, getUser, setUser, thumbUrl, downloadUrl,
     toast, modal, confirmDlg, promptDlg, showLoginModal, logout, ensureLogin,
     renderNav, renderUserChip, esc, fmtBytes, fmtTs, fmtAgo, fmtDur, fileIcon, poll,
     sha256Hex, svgDonut, svgBars, svgLine, sparkline, legend, PALETTE,
     healthBadge, stateBadge, qs,
+    quotaLevelClass, quotaLevelText, quotaBar, quotaCard, quotaCleanupHtml,
+    showQuotaExceeded, withQuotaGuard,
   };
 })();
 

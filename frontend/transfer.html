@@ -31,6 +31,9 @@
         <div class="card">
           <div class="card-title">⇧ 分块上传 <span class="hint">浏览器切片 → NameNode 暂存 → 分块 → 流水线 3 副本</span></div>
 
+          <!-- 我的配额（已用含活动文件/回收站/历史版本） -->
+          <div id="my-quota" class="quota-card qcard-dim" style="margin-bottom:12px"></div>
+
           <div class="dropzone" id="dropzone">
             <div style="font-size:30px">📄</div>
             点击选择或拖拽文件到此处<br>
@@ -130,7 +133,25 @@
 <script src="js/app.js"></script>
 <script>
 "use strict";
-const { api, esc, fmtBytes, fmtDur, toast, modal, sha256Hex, getToken } = DFSVS;
+const { api, esc, fmtBytes, fmtDur, toast, modal, sha256Hex, getToken,
+        quotaBar, quotaLevelClass, quotaLevelText, quotaCleanupHtml,
+        showQuotaExceeded, withQuotaGuard } = DFSVS;
+
+// ------------------------------------------------------------------ 我的配额
+async function loadMyQuota() {
+  try {
+    const me = await api("GET", "/api/quotas/me");
+    const box = document.getElementById("my-quota");
+    box.className = "quota-card qcard-" + quotaLevelClass(me.level);
+    box.innerHTML = `
+      <div class="qc-head">📦 我的存储额度
+        <span class="badge ${quotaLevelClass(me.level)} plain">${esc(quotaLevelText(me.level))}</span></div>
+      ${me.limited ? quotaBar(me) :
+        `<div class="small dim">已用 ${fmtBytes(me.used_bytes)}（活动 ${fmtBytes(me.breakdown.active)} · 回收站 ${fmtBytes(me.breakdown.trash)} · 历史版本 ${fmtBytes(me.breakdown.history)}），未设置上限</div>`}
+      <div class="qc-break small dim">含回收站与历史版本；<a href="quotas.html">配额管理 →</a></div>`;
+    return me;
+  } catch (e) { return null; }
+}
 
 const CHAOS = () => document.getElementById("chaos-toggle").checked;
 
@@ -174,6 +195,30 @@ function setFile(f) {
   renderPieces(0, 0);
   setUpStatus("就绪");
   checkResume(f);
+  precheckQuota(f);
+}
+
+// 选择文件后立即按声明大小做配额预检，给出剩余额度提示
+async function precheckQuota(f) {
+  const path = document.getElementById("up-path").value.trim() || "/";
+  setUpStatus("正在检查存储配额…");
+  try {
+    const r = await api("POST", "/api/quotas/check",
+      { path, filename: f.name, size: f.size });
+    if (!r.allowed) {
+      showQuotaExceeded(r.violations[0]);
+      setUpStatus("存储空间不足，上传已拦截（见弹窗）");
+    } else {
+      const mine = r.checks.find(c => c.scope === "user");
+      if (mine && mine.limit_bytes) {
+        setUpStatus(`配额预检通过：写入后剩余 ${fmtBytes(mine.projected_free)}`);
+      } else {
+        setUpStatus("配额预检通过（未设上限）");
+      }
+    }
+  } catch (e) {
+    setUpStatus("配额预检失败：" + e.message);
+  }
 }
 
 function guessDir(name) {
@@ -226,6 +271,9 @@ async function checkResume(f) {
 }
 
 document.getElementById("up-start").onclick = () => startUpload(null);
+document.getElementById("up-path").addEventListener("change", () => {
+  if (upFile) precheckQuota(upFile);
+});
 document.getElementById("up-pause").onclick = () => {
   if (upState) { upState.paused = !upState.paused;
     document.getElementById("up-pause").textContent = upState.paused ? "继续" : "暂停";
@@ -247,10 +295,14 @@ async function startUpload(existingSession) {
   document.getElementById("up-pause").textContent = "暂停";
 
   try {
-    const begin = await api("POST", "/api/upload/begin", {
+    const begin = await withQuotaGuard(() => api("POST", "/api/upload/begin", {
       path, filename: upFile.name, size: upFile.size,
       piece_size: piece, session: existingSession || undefined,
-    });
+    }));
+    if (begin && begin.quotaBlocked) {
+      finishUpload("存储空间不足，上传未开始", false);
+      return;
+    }
     upState = {
       session: begin.session, total: begin.total_pieces, piece: begin.piece_size,
       received: new Set(begin.received || []), paused: false, running: true, aborted: false,
@@ -306,9 +358,15 @@ async function startUpload(existingSession) {
     }
 
     setUpStatus("所有分片就绪，服务端合并 → 分块 → 流水线复制 3 副本 …");
-    const r = await api("POST", "/api/upload/complete", { session: upState.session });
+    const r = await withQuotaGuard(() =>
+      api("POST", "/api/upload/complete", { session: upState.session }));
+    if (r && r.quotaBlocked) {
+      finishUpload("存储空间不足：合并被拦截（分片暂存于服务端，清理空间后可重试）", false);
+      return;
+    }
     const all2 = lsGet(); delete all2[lsKey(upFile)]; lsSet(all2);
     finishUpload("完成", true, r);
+    loadMyQuota();
   } catch (e) {
     finishUpload("失败：" + e.message, false);
   }
@@ -530,10 +588,11 @@ async function loadSessions() {
 document.getElementById("sess-refresh").onclick = loadSessions;
 
 initPage("transfer.html", "上传下载").then(() => {
+  loadMyQuota();
   const p = DFSVS.qs("path");
   if (p) { document.getElementById("dl-path").value = p; document.getElementById("dl-query").click(); }
   loadSessions();
-  DFSVS.poll(loadSessions, 5000);
+  DFSVS.poll(() => { loadSessions(); loadMyQuota(); }, 8000);
 });
 </script>
 </body>

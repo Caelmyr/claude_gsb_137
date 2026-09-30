@@ -377,8 +377,19 @@ class VirtualFS:
             item_id = gen_id("rc")
             inode["parent"] = self.trash_id
             inode["_orig_name"] = inode["name"]
+            # 记录删除者：回收站占用按删除者计费（含子树内全部文件）
+            inode["_deleted_by"] = actor
             inode["name"] = item_id            # trash 下用 item_id 命名防冲突
             trash["children"].append(inode["id"])
+
+            def _tag_subtree(iid):
+                node = self._inodes().get(iid)
+                if node:
+                    node["_deleted_by"] = actor
+                    for cid in node.get("children", []):
+                        _tag_subtree(cid)
+
+            _tag_subtree(inode["id"])
 
             stats = (self.dir_stats(inode) if inode["type"] == "dir"
                      else {"files": 1, "bytes": inode.get("size", 0),
@@ -444,6 +455,7 @@ class VirtualFS:
                 n += 1
             inode["name"] = name
             inode.pop("_orig_name", None)
+            inode.pop("_deleted_by", None)
             inode["parent"] = parent["id"]
             parent["children"].append(inode["id"])
             self._touch_dir_mtime(parent)

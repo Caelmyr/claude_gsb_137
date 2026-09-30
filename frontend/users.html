@@ -33,7 +33,7 @@
           </div>
           <div class="table-wrap"><table class="tbl">
             <thead><tr>
-              <th>用户</th><th>角色</th><th>邮箱</th><th>备注</th><th>状态</th>
+              <th>用户</th><th>角色</th><th>存储配额</th><th>邮箱</th><th>备注</th><th>状态</th>
               <th>创建时间</th><th>最近登录</th><th class="right">登录次数</th><th>操作</th>
             </tr></thead>
             <tbody id="user-body"></tbody>
@@ -64,17 +64,24 @@
 <script src="js/app.js"></script>
 <script>
 "use strict";
-const { api, esc, fmtTs, fmtAgo, toast, modal, confirmDlg, promptDlg } = DFSVS;
+const { api, esc, fmtTs, fmtAgo, toast, modal, confirmDlg, promptDlg,
+        fmtBytes, quotaBar, quotaLevelClass, quotaLevelText } = DFSVS;
 
 let canAdmin = false;
 let roles = {};
+let quotaMap = {};
 
 const ROLE_BADGE = { admin: "bad", operator: "acc", viewer: "dim" };
 
 async function loadUsers() {
   try {
-    const d = await api("GET", "/api/users");
+    const [d, q] = await Promise.all([
+      api("GET", "/api/users"),
+      api("GET", "/api/quotas").catch(() => ({ users: [] })),
+    ]);
     roles = d.roles || {};
+    quotaMap = {};
+    for (const u of (q.users || [])) quotaMap[u.user] = u;
     document.getElementById("no-perm").style.display = "none";
     document.getElementById("main-pane").style.display = "";
     canAdmin = true;
@@ -95,6 +102,7 @@ function renderUsers(users) {
     <tr>
       <td><b>${esc(u.username)}</b>${u.username === "admin" ? ' <span class="badge dim plain">内置</span>' : ""}</td>
       <td><span class="badge ${ROLE_BADGE[u.role] || "dim"} plain">${esc((roles[u.role] || {}).label || u.role)}</span></td>
+      <td style="min-width:200px" id="qcell-${esc(u.username)}">${renderQuotaCell(u.username)}</td>
       <td class="small dim">${esc(u.email || "-")}</td>
       <td class="small dim">${esc(u.note || "-")}</td>
       <td>${u.status === "active" ? '<span class="badge ok plain">启用</span>' : '<span class="badge bad plain">停用</span>'}</td>
@@ -103,6 +111,7 @@ function renderUsers(users) {
       <td class="num right">${u.login_count || 0}</td>
       <td class="nowrap">
         <button class="btn xs u-edit" data-u='${esc(JSON.stringify(u))}'>✎ 编辑</button>
+        <button class="btn xs u-quota" data-u="${esc(u.username)}">📦 配额</button>
         <button class="btn xs u-reset" data-u="${esc(u.username)}">🔑 重置口令</button>
         ${u.username !== "admin" ? `<button class="btn xs danger u-del" data-u="${esc(u.username)}">删除</button>` : ""}
       </td>
@@ -110,10 +119,22 @@ function renderUsers(users) {
   bind(users);
 }
 
+function renderQuotaCell(username) {
+  const q = quotaMap[username];
+  if (!q) return `<span class="small dim">-</span>`;
+  const badge = `<span class="badge ${quotaLevelClass(q.level)} plain">${esc(quotaLevelText(q.level))}</span>`;
+  if (!q.limited)
+    return `${badge} <span class="small dim">${fmtBytes(q.used_bytes)} / 不限</span>`;
+  return `${badge}<div style="margin-top:3px">${quotaBar(q, { compact: true })}</div>`;
+}
+
 function bind(users) {
   document.querySelectorAll(".u-edit").forEach(b => b.onclick = () => {
     const u = JSON.parse(b.dataset.u);
     editUser(u);
+  });
+  document.querySelectorAll(".u-quota").forEach(b => b.onclick = () => {
+    location.href = "quotas.html#u=" + encodeURIComponent(b.dataset.u);
   });
   document.querySelectorAll(".u-reset").forEach(b => b.onclick = () => resetPw(b.dataset.u));
   document.querySelectorAll(".u-del").forEach(b => b.onclick = () => {

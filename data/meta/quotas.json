@@ -1,0 +1,51 @@
+{
+ "doc": "quotas",
+ "vv": {
+  "namenode": 10
+ },
+ "updated_at": 1790740222.7419188,
+ "data": {
+  "user": {
+   "alice": {
+    "limit_bytes": 1350,
+    "note": "演示：历史版本+回收站导致的超限态",
+    "updated_at": 1790740222.7305787,
+    "updated_by": "system"
+   },
+   "bob": {
+    "limit_bytes": 212,
+    "note": "只读账号：宽松上限",
+    "updated_at": 1790740222.7318995,
+    "updated_by": "system"
+   },
+   "carol": {
+    "limit_bytes": 2873,
+    "note": "停用账号：配额仍生效",
+    "updated_at": 1790740222.737704,
+    "updated_by": "system"
+   }
+  },
+  "dir": {
+   "/data": {
+    "limit_bytes": 2840164,
+    "note": "数据目录容量预算（接近水位告警）",
+    "updated_at": 1790740222.7391322,
+    "updated_by": "system"
+   },
+   "/docs": {
+    "limit_bytes": 12030,
+    "note": "文档目录预留充足额度",
+    "updated_at": 1790740222.7405941,
+    "updated_by": "system"
+   },
+   "/tmp": {
+    "limit_bytes": 26,
+    "note": "临时目录：小配额演练（回收站占删除者用户额度）",
+    "updated_at": 1790740222.7419145,
+    "updated_by": "system"
+   }
+  },
+  "default_user_limit": 0,
+  "updated_at": 1790740222.7419174
+ }
+}

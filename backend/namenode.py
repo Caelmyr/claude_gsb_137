@@ -33,6 +33,7 @@ from . import chunking, config
 from .auth import AuthManager, PermissionManager
 from .filesystem import FsError, VirtualFS
 from .metadata import MetadataStore
+from .quotas import QuotaError, QuotaExceeded, QuotaManager
 from .util import (HttpError, LRU, RateCounter, RingBuffer, b64e, gen_id,
                    guess_mime, hour_key, http_json, http_request,
                    is_text_mime, needs_recovery, canonical_access_op,
@@ -69,6 +70,7 @@ class NameNode:
         self.auth = AuthManager(self.meta)
         self.perms = PermissionManager(self.meta, self.auth)
         self.versions = VersionStore(self)
+        self.quotas = QuotaManager(self)
 
         # ---- 节点注册表（内存态；摘要持久化到 cluster 文档） ----
         self.nodes = {}                  # node_id -> NodeInfo dict
@@ -105,6 +107,7 @@ class NameNode:
         self.fs.init_root()
         self.auth.ensure_seed()
         self.perms.ensure_seed()
+        self.quotas.ensure_seed()
         self.versions.ensure_head()
         self._init_blocks_doc()
         self._init_stats_doc()
@@ -1001,6 +1004,9 @@ class NameNode:
                     return self._session_view(sess)
             if len(self.sessions) >= config.UPLOAD_SESSION_MAX:
                 raise NNError("上传会话过多，请稍后再试")
+            # ---- 配额预检查（按声明大小，覆盖/去重按最坏情况保守估算）----
+            target = path.rstrip("/") + "/" + filename
+            self.quotas.guard_upload(user, target, int(size or 0))
             sess_id = session_id or gen_id("up")
             stage_dir = os.path.join(config.SESSION_DIR, sess_id)
             os.makedirs(stage_dir, exist_ok=True)
@@ -1091,6 +1097,10 @@ class NameNode:
             raise NNError(f"拼接后大小不符: {len(data)} != {sess['size']}")
         t0 = now()
         full_path = sess["path"].rstrip("/") + "/" + sess["filename"]
+        # ---- 配额权威复核：真实内容哈希 + 精确覆盖/去重投影 ----
+        # 在任何数据块写入 DataNode 之前拦截，杜绝"超了还能写"。
+        self.quotas.guard_upload(sess.get("user") or user, full_path,
+                                 len(data), new_hash=sha256_bytes(data))
         info = self.write_file_internal(full_path, data, user)
         elapsed = now() - t0
         result = {

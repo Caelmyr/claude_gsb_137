@@ -1,11 +1,42 @@
 {
  "doc": "recycle",
  "vv": {
-  "namenode": 4
+  "namenode": 2
  },
- "updated_at": 1790409364.6117103,
+ "updated_at": 1790740222.714511,
  "data": {
-  "items": {},
+  "items": {
+   "rc_495cad70c999": {
+    "id": "rc_495cad70c999",
+    "inode": "in_df6788c4c143",
+    "name": "draft-old.md",
+    "type": "file",
+    "original_path": "/tmp/draft-old.md",
+    "original_parent": "in_144b008e0642",
+    "deleted_at": 1790740222.6759038,
+    "deleted_by": "bob",
+    "retention_days": 7,
+    "expires_at": 1790765422.6759038,
+    "size": 53,
+    "files": 1,
+    "blocks": 1
+   },
+   "rc_bdf41c56db03": {
+    "id": "rc_bdf41c56db03",
+    "inode": "in_ed53c8deebaa",
+    "name": "scratch.txt",
+    "type": "file",
+    "original_path": "/tmp/scratch.txt",
+    "original_parent": "in_144b008e0642",
+    "deleted_at": 1790740222.7125547,
+    "deleted_by": "alice",
+    "retention_days": 7,
+    "expires_at": 1790765422.712555,
+    "size": 19,
+    "files": 1,
+    "blocks": 1
+   }
+  },
   "retention_days": 7
  }
 }

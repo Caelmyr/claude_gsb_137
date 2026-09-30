@@ -10,7 +10,7 @@
 纯 Python（标准库，零第三方依赖）+ 原生 HTML/CSS/JS 实现的**教学级分布式文件系统**：
 模拟 HDFS 风格的 NameNode / DataNode 集群（节点间全 HTTP 通信），
 在其上叠加 Git 风格的版本控制（提交 / 分支 / 三方合并 / 检出），
-并提供 11 个页面的管理控制台。
+并提供 12 个页面的管理控制台。
 
 代码规模：**约 12,000 行**（后端 ~8,700 行 Python，前端 ~4,400 行 HTML/CSS/JS）。
 
@@ -54,7 +54,8 @@ python3 -m backend.datanode --id dn5 --port 8025
 | 差异对比 | `diff.html` | 版本 diff + 文本 diff 双模式、Myers/Patience/difflib 选择、unified/双栏视图、行内字符级高亮、大文件性能试验台 |
 | 节点状态 | `nodes.html` | 节点卡片（心跳/容量/IO/版本向量）、块×节点副本矩阵、恢复队列、杀死/复活/注入损坏演练、实时事件流 |
 | 存储统计 | `stats.html` | 容量 donut、副本数分布、块大小直方图、24h 吞吐、容量趋势、类型分布、热度榜（sparkline）、元数据文档表 |
-| 用户管理 | `users.html` | 用户 CRUD、角色能力矩阵、活动会话与吊销 |
+| 用户管理 | `users.html` | 用户 CRUD、角色能力矩阵、活动会话与吊销、配额状态列 |
+| 存储配额 | `quotas.html` | 用户/目录配额实时用量（已用含活动文件+回收站+历史版本）、上限调整、超限可清理项 |
 | 权限设置 | `permissions.html` | 路径前缀 ACL 规则编辑器、默认策略、**判定轨迹测试器** |
 | 系统日志 | `logs.html` | 级别/来源/用户/关键字过滤、分页、展开详情、自动刷新、CSV 导出、清空 |
 | 回收站 | `recycle.html` | 保留期倒计时、恢复 / 彻底删除 / 清空 |
@@ -93,7 +94,7 @@ python3 -m backend.datanode --id dn5 --port 8025
 元数据目录布局（`data/`，全部 JSON，崩溃安全）：
 
 ```
-data/meta/{fs,blocks,versions,users,perms,logs,recycle,stats,cluster}.json
+数据/meta/{fs,blocks,versions,users,perms,quotas,logs,recycle,stats,cluster}.json
 data/sessions/<upload_id>/piece_000000      # 上传分片暂存
 data/datanodes/<node_id>/blocks/<blk>.dat   # 块本体
 data/datanodes/<node_id>/node_state.json    # DN 索引（原子写）
@@ -147,7 +148,21 @@ data/datanodes/<node_id>/doc_cache/*.json   # DN 同步到的元数据文档
   重叠且不同 → 冲突块；相同 → 采纳其一。
 * 渲染：unified / 双栏 / 行内字符级高亮；统计与计时返回前端展示。
 
-### 4.5 JSON 元数据多节点同步：原子写 + 版本向量
+### 4.5 存储配额（用户级 / 目录级，含回收站与历史版本）
+* **计量口径唯一**：用量 = 活动文件 ∪ 回收站 ∪ 全部历史提交快照 引用到
+  的内容，按 `content_hash` 去重后的逻辑字节和（`quotas.py`）。
+  删除进回收站、旧版本留在提交历史里都**不释放额度**，杜绝
+  「删了文件仍被判超限」与「明明超了还能继续写」。
+* 回收站占用按**删除者**计费；目录配额按前缀作用于活动文件+历史版本，
+  祖先与后代配额需同时满足。
+* **两道写拦截**：`upload/begin` 按声明大小确定性预判（文件本身大于
+  剩余额度即拦，避免分片白传）；`upload/complete` 在数据落 DataNode 前
+  用真实哈希做权威复核，精确处理覆盖释放与内容去重。
+* 超限返回 **413 + 结构化裁决**：超出字节、活动/回收站/历史占用构成、
+  可立即清理的回收站条目、仅历史引用的内容量；前端弹窗据此给出
+  「超了多少 + 哪些数据能清理」，而非一句冷报错。
+
+### 4.6 JSON 元数据多节点同步：原子写 + 版本向量
 * **原子写**（`util.atomic_write_*`）：同目录临时文件 → flush → fsync →
   `os.replace` → 目录 fsync；读者永远看到完整旧/新文件。
   块文件、分片暂存、DN 索引同样走原子写。
@@ -176,6 +191,9 @@ GET  /api/health/queue           GET /api/sim/events
 POST /api/sim/kill|revive|corrupt|chaos                （admin）
 GET  /api/stats/overview|hotness|timeline
 GET|POST /api/users  PUT|DELETE /api/users/<name>      （user_admin）
+GET /api/quotas/me|dirs          POST /api/quotas/check
+GET|POST /api/quotas  POST|DELETE /api/quotas/users/<name>  （admin）
+GET /api/quotas/users/<name>  POST /api/quotas/dirs|dirs/remove  （admin）
 GET|POST /api/perms  PUT|DELETE /api/perms/<id>        （perm_admin）
 POST /api/perms/check
 GET  /api/logs|logs/export       POST /api/logs/clear  （admin）

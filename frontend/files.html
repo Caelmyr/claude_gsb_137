@@ -45,6 +45,9 @@
             <button class="btn sm ghost" id="btn-refresh">⟳</button>
           </div>
 
+          <!-- 当前目录配额水位（含该前缀下活动文件 + 历史版本） -->
+          <div class="quota-card" id="dir-quota" style="display:none;margin-bottom:12px"></div>
+
           <div class="card" style="padding:14px">
             <div class="file-grid" id="file-grid"></div>
           </div>
@@ -67,7 +70,29 @@
 <script>
 "use strict";
 const { api, esc, fmtBytes, fmtTs, fmtAgo, toast, modal, confirmDlg, promptDlg,
-        fileIcon, thumbUrl, healthBadge, getToken } = DFSVS;
+        fileIcon, thumbUrl, healthBadge, getToken, quotaBar, quotaLevelClass,
+        quotaLevelText } = DFSVS;
+
+let quotaDirs = [];
+
+async function loadQuotas() {
+  try {
+    const ov = await api("GET", "/api/quotas/dirs");
+    quotaDirs = ov.dirs || [];
+    renderDirQuota();
+  } catch (e) { quotaDirs = []; /* 未登录等场景静默 */ }
+}
+
+/** 找到覆盖当前路径的最深目录配额。 */
+function quotaForPath(path) {
+  let best = null;
+  for (const d of quotaDirs) {
+    if (path === d.path || path.startsWith(d.path.replace(/\/$/, "") + "/")) {
+      if (!best || d.path.length > best.path.length) best = d;
+    }
+  }
+  return best;
+}
 
 let currentPath = DFSVS.qs("path", "/");
 let selected = null;      // 当前选中条目
@@ -124,7 +149,26 @@ async function loadList() {
   const data = await api("GET", "/api/fs/list?path=" + encodeURIComponent(currentPath));
   renderBreadcrumb(data);
   renderGrid(data.items);
+  renderDirQuota();
   return data;
+}
+
+function renderDirQuota() {
+  const box = document.getElementById("dir-quota");
+  const d = quotaForPath(currentPath);
+  if (!d) { box.style.display = "none"; return; }
+  const cls = quotaLevelClass(d.level);
+  box.style.display = "";
+  box.className = "quota-card qcard-" + cls;
+  box.innerHTML = `
+    <div class="qc-head">🗀 目录配额 <span class="mono">${esc(d.path)}</span>
+      <span class="badge ${cls} plain">${esc(quotaLevelText(d.level))}</span></div>
+    ${quotaBar(d)}
+    <div class="qc-break small dim">
+      活动文件 <b>${fmtBytes(d.breakdown.active)}</b> ·
+      历史版本 <b>${fmtBytes(d.breakdown.history)}</b>
+      （回收站条目计入删除者用户配额，不计回本目录）
+      · <a href="quotas.html">配额管理</a></div>`;
 }
 
 function renderBreadcrumb(data) {
@@ -305,7 +349,7 @@ document.getElementById("btn-mkdir").onclick = () => {
 // ------------------------------------------------------------------ 刷新
 async function refresh() {
   try {
-    await Promise.all([loadTree(), loadList()]);
+    await Promise.all([loadTree(), loadList(), loadQuotas()]);
     history.replaceState(null, "", "?path=" + encodeURIComponent(currentPath));
   } catch (e) { toast("加载失败：" + e.message, "bad"); }
 }

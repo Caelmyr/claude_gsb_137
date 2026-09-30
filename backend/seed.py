@@ -429,6 +429,9 @@ def seed_cluster(nn, datanodes=None, verbose=True):
     say("生成历史访问热度与吞吐数据 …")
     _seed_stats(nn)
 
+    say("注入存储配额（用户级 / 目录级）…")
+    _seed_quotas(nn)
+
     say("注入历史日志 …")
     _seed_logs(nn)
 
@@ -472,6 +475,65 @@ def _seed_perms(nn):
         try:
             pm.add_rule(path, principal, ptype, perms, effect, prio, note)
         except AuthError:
+            pass
+
+
+def _seed_quotas(nn):
+    """按真实用量的相对比例设置演示配额（制造 ok / 告警 / 超限三态）。"""
+    from .quotas import QuotaError
+
+    # 目录配额需先写入规则再统计用量（_collect 只统计已配置配额的前缀），
+    # 先给一个临时上限，写完后立刻按真实用量校准。
+    dir_plans = [
+        ("/data", 0.85, "数据目录容量预算（接近水位告警）"),
+        ("/docs", 2.0, "文档目录预留充足额度"),
+        ("/tmp", 0.5, "临时目录：小配额演练（回收站占删除者用户额度）"),
+    ]
+    for path, _ratio, note in dir_plans:
+        try:
+            nn.quotas.set_dir_quota(path, 1, note, "system")
+        except QuotaError:
+            pass
+
+    ov = nn.quotas.overview()
+    user_used = {v["user"]: v["used_bytes"] for v in ov["users"]}
+    dir_used = {v["path"]: v["used_bytes"] for v in ov["dirs"]}
+
+    def used(name):
+        return int(user_used.get(name, 0))
+
+    # alice：上限压到略低于既有占用 => 初始即"超限"，上传被拦并给出清理建议
+    # bob（只读 viewer）：宽松上限，演示正常水位
+    # carol（停用账号）：略低于占用，演示超限态
+    plans = [
+        ("alice", max(1, int(used("alice") * 0.6)),
+         "演示：历史版本+回收站导致的超限态"),
+        ("bob", max(1, int(used("bob") * 4)) if used("bob") else 64 * 1024,
+         "只读账号：宽松上限"),
+        ("carol", max(1, int(used("carol") * 0.9)) if used("carol") else None,
+         "停用账号：配额仍生效"),
+    ]
+    for username, limit, note in plans:
+        if limit is None:
+            continue
+        try:
+            nn.quotas.set_user_quota(username, limit, note, "system")
+        except QuotaError:
+            pass
+
+    for path, ratio, note in dir_plans:
+        cur = int(dir_used.get(path, 0))
+        if cur <= 0:
+            # 目录无任何用量（规则也没有存在意义），移除临时规则
+            try:
+                nn.quotas.set_dir_quota(path, 0, actor="system")
+            except QuotaError:
+                pass
+            continue
+        try:
+            nn.quotas.set_dir_quota(path, max(1, int(cur * ratio)),
+                                    note, "system")
+        except QuotaError:
             pass
 
 

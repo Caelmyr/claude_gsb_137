@@ -27,6 +27,7 @@ from . import config, diff_engine
 from .auth import AuthError
 from .filesystem import FsError
 from .namenode import MissingBlockError, NNError
+from .quotas import QuotaError, QuotaExceeded
 from .util import (content_range_value, decode_text, now, parse_range,
                    sha256_bytes, short_hash, to_rate_units)
 from .versioning import VersionError
@@ -761,6 +762,88 @@ def api_perms_check(ctx):
 
 
 # ============================================================================
+# API: 存储配额（用户级 / 目录级）
+# ============================================================================
+
+@route("GET", "/api/quotas", cap="admin")
+def api_quotas_overview(ctx):
+    """配额管理页：全部用户 + 目录的已用/上限/剩余（含回收站与历史版本）。"""
+    return ctx.nn.quotas.overview()
+
+
+@route("POST", "/api/quotas/users/<name>", cap="admin")
+def api_quotas_set_user(ctx):
+    body = ctx.json()
+    result = ctx.nn.quotas.set_user_quota(
+        ctx.params["name"], body.get("limit_bytes"),
+        body.get("note", ""), ctx.actor())
+    return result
+
+
+@route("GET", "/api/quotas/users/<name>", cap="admin")
+def api_quotas_user_detail(ctx):
+    """管理员查看任意用户的用量明细与可清理项。"""
+    return ctx.nn.quotas.user_view(ctx.params["name"])
+
+
+@route("DELETE", "/api/quotas/users/<name>", cap="admin")
+def api_quotas_del_user(ctx):
+    return ctx.nn.quotas.set_user_quota(ctx.params["name"], 0,
+                                        actor=ctx.actor())
+
+
+@route("POST", "/api/quotas/dirs", cap="admin")
+def api_quotas_set_dir(ctx):
+    body = ctx.json()
+    return ctx.nn.quotas.set_dir_quota(body.get("path", "/"),
+                                       body.get("limit_bytes"),
+                                       body.get("note", ""), ctx.actor())
+
+
+@route("POST", "/api/quotas/dirs/remove", cap="admin")
+def api_quotas_del_dir(ctx):
+    body = ctx.json()
+    return ctx.nn.quotas.set_dir_quota(body.get("path", "/"), 0,
+                                       actor=ctx.actor())
+
+
+@route("GET", "/api/quotas/me")
+def api_quotas_me(ctx):
+    """当前登录用户自查：已用/上限/剩余 + 超限时的可清理项。"""
+    return ctx.nn.quotas.user_view(ctx.actor())
+
+
+@route("GET", "/api/quotas/dirs")
+def api_quotas_dirs_public(ctx):
+    """目录配额水位（所有登录用户可见，文件浏览页展示）。"""
+    path = ctx.query.get("path")
+    ov = ctx.nn.quotas.overview()
+    dirs = ov["dirs"]
+    if path:
+        dirs = [d for d in dirs
+                if path == d["path"]
+                or path.startswith(d["path"].rstrip("/") + "/")
+                or d["path"].startswith(path.rstrip("/") + "/")]
+    return {"dirs": dirs}
+
+
+@route("POST", "/api/quotas/check")
+def api_quotas_check(ctx):
+    """
+    上传前预检（前端选择文件后即可提示，不必等分片传完）：
+    {path, filename, size} -> {allowed, violations:[...], checks:[...]}
+    """
+    body = ctx.json()
+    path = body.get("path", "/")
+    filename = body.get("filename", "")
+    size = int(body.get("size", 0) or 0)
+    ctx.require_perm(path, "write")
+    target = path.rstrip("/") + "/" + filename
+    verdict = ctx.nn.quotas.evaluate_write(ctx.actor(), target, size)
+    return verdict
+
+
+# ============================================================================
 # API: 日志
 # ============================================================================
 
@@ -1030,6 +1113,13 @@ class NameNodeHandler(BaseHTTPRequestHandler):
             self._send_json({"error": e.message}, e.status)
         except AuthError as e:
             self._send_json({"error": str(e)}, 403)
+        except QuotaExceeded as e:
+            # 结构化配额错误：413 + 裁决详情（超了多少 / 构成 / 可清理项）
+            payload = {"error": str(e), "quota_exceeded": True,
+                       "verdict": e.verdict}
+            self._send_json(payload, 413)
+        except QuotaError as e:
+            self._send_json({"error": str(e)}, 400)
         except MissingBlockError as e:
             self._send_json({"error": str(e), "degraded": True}, 503)
         except (FsError, NNError, VersionError, ValueError) as e:

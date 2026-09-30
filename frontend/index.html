@@ -70,6 +70,15 @@
             <div id="health-box"></div>
           </div>
 
+          <!-- 我的存储配额 -->
+          <div class="card">
+            <div class="card-title">我的存储额度
+              <span class="spacer"></span>
+              <a class="small" href="quotas.html">配额管理 →</a>
+            </div>
+            <div id="my-quota-box" class="small muted">加载中…</div>
+          </div>
+
           <!-- 事件流 -->
           <div class="card">
             <div class="card-title">集群事件 <span class="spacer"></span>
@@ -95,16 +104,17 @@
 <script>
 "use strict";
 const { api, esc, fmtBytes, fmtAgo, fmtTs, toast, svgDonut, legend, PALETTE,
-        stateBadge, sparkline } = DFSVS;
+        stateBadge, sparkline, quotaCard } = DFSVS;
 
 async function loadAll() {
-  const [ov, nodes, commits, logs, events, hot] = await Promise.all([
+  const [ov, nodes, commits, logs, events, hot, me] = await Promise.all([
     api("GET", "/api/stats/overview"),
     api("GET", "/api/nodes"),
     api("GET", "/api/version/commits?limit=6"),
     api("GET", "/api/logs?limit=8"),
     api("GET", "/api/sim/events?limit=14"),
     api("GET", "/api/stats/hotness?limit=5"),
+    api("GET", "/api/quotas/me"),
   ]);
   renderKpis(ov, nodes);
   renderCapacity(ov, nodes);
@@ -113,6 +123,14 @@ async function loadAll() {
   renderLogs(logs);
   renderEvents(events);
   renderHot(hot);
+  renderMyQuota(me);
+}
+
+function renderMyQuota(me) {
+  document.getElementById("my-quota-box").innerHTML = quotaCard(me) + `
+    <div class="small dim" style="margin-top:8px">
+      ${me.limited ? `距离上限还剩 <b>${fmtBytes(me.free_bytes)}</b>，` : ""}
+      用量含回收站与历史版本。</div>`;
 }
 
 function renderKpis(ov, nodes) {
